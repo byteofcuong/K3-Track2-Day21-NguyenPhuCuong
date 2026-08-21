@@ -11,3 +11,6 @@ sa-key.json
 __pycache__/
 *.pyc
 .DS_Store
+mlruns/
+.pytest_cache/
+infra/secrets.txt

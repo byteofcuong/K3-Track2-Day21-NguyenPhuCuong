@@ -9,6 +9,9 @@ on:
       - 'params.yaml'
   workflow_dispatch:
 
+env:
+  AWS_REGION: us-east-1
+
 jobs:
 
   # ---------------------------------------------------------------------------
@@ -31,14 +34,18 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run unit tests
-        # TODO 1: Viet lenh de chay pytest tren thu muc tests/ voi co -v
-        run: # <dien lenh o day>
+        run: pytest tests/ -v
 
 
   # ---------------------------------------------------------------------------
   # JOB 2 - TRAIN
   # Xac thuc cloud storage, pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
   # Chi chay khi Job 1 (Unit Test) hoan thanh thanh cong.
+  #
+  # Model moi duoc upload len prefix `models/candidate/`, KHONG phai `models/latest/`.
+  # `models/latest/` la model dang duoc phuc vu; chi job Deploy moi duoc quyen ghi de
+  # len do, sau khi da qua eval gate. Nho vay mot model kem khong bao gio thay the
+  # model dang chay, ke ca khi VM tinh co reboot giua chung.
   # ---------------------------------------------------------------------------
   train:
     name: Train
@@ -46,6 +53,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       accuracy: ${{ steps.read_metrics.outputs.accuracy }}
+      threshold: ${{ steps.read_metrics.outputs.threshold }}
+      previous_accuracy: ${{ steps.previous.outputs.previous_accuracy }}
 
     steps:
       - uses: actions/checkout@v4
@@ -58,55 +67,97 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Authenticate to Cloud Storage
-        # TODO 2: Ghi noi dung credentials ra file tam va set bien moi truong xac thuc.
-        # GCP:   echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/sa-key.json
-        #        echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
-        # AWS:   echo "AWS_ACCESS_KEY_ID=..." >> $GITHUB_ENV  (lay tu secrets)
-        #        echo "AWS_SECRET_ACCESS_KEY=..." >> $GITHUB_ENV
-        # Azure: echo "AZURE_STORAGE_CONNECTION_STRING=..." >> $GITHUB_ENV
+        # Secret CLOUD_CREDENTIALS la JSON:
+        #   {"aws_access_key_id": "...", "aws_secret_access_key": "..."}
+        # GitHub chi tu dong che giau chuoi secret nguyen ven, khong che giau tung
+        # truong ben trong, nen phai goi ::add-mask:: cho tung gia tri truoc khi ghi
+        # vao GITHUB_ENV.
+        env:
+          CLOUD_CREDENTIALS: ${{ secrets.CLOUD_CREDENTIALS }}
         run: |
-          # <dien code o day>
+          python - <<'PY'
+          import json, os
+          creds = json.loads(os.environ["CLOUD_CREDENTIALS"])
+          key_id = creds["aws_access_key_id"]
+          secret = creds["aws_secret_access_key"]
+          print(f"::add-mask::{key_id}")
+          print(f"::add-mask::{secret}")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"AWS_ACCESS_KEY_ID={key_id}\n")
+              env.write(f"AWS_SECRET_ACCESS_KEY={secret}\n")
+              env.write(f"AWS_DEFAULT_REGION={os.environ['AWS_REGION']}\n")
+          PY
+
+      - name: Read currently deployed metrics
+        id: previous
+        # Bonus 4: doc accuracy cua model DANG CHAY truoc khi huan luyen model moi.
+        # Lan chay dau tien chua co file nay -> de trong va bo qua buoc so sanh.
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+        run: |
+          if aws s3 cp "s3://$CLOUD_BUCKET/models/latest/metrics.json" /tmp/previous.json 2>/dev/null; then
+            PREV=$(python -c "import json; print(json.load(open('/tmp/previous.json'))['accuracy'])")
+            echo "previous_accuracy=$PREV" >> $GITHUB_OUTPUT
+            echo "Model dang chay co accuracy = $PREV"
+          else
+            echo "previous_accuracy=" >> $GITHUB_OUTPUT
+            echo "Chua co model nao duoc trien khai (lan chay dau tien)."
+          fi
 
       - name: Pull data with DVC
-        # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
-        #         Chi pull train_phase1.csv va eval.csv (khong can train_phase2.csv).
-        run: # <dien lenh o day>
+        # Chi pull hai file can cho huan luyen; train_phase2.csv khong can tren runner.
+        run: dvc pull data/train_phase1.csv data/eval.csv
 
       - name: Train model
+        # Bonus 1: neu ba secret MLFLOW_* duoc dat, moi lan chay CI se duoc ghi len
+        # tracking server cua DagsHub. Neu chua dat, chung la chuoi rong va train.py
+        # tu quay ve SQLite cuc bo - pipeline van chay binh thuong.
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+          MLFLOW_EXPERIMENT_NAME: wine-quality
         run: python src/train.py
 
       - name: Read metrics
         id: read_metrics
-        # TODO 4: Doc gia tri "accuracy" tu outputs/metrics.json bang Python inline.
-        #         Set ket qua thanh output "accuracy" de job deploy co the doc.
-        #
-        # Goi y:
-        #   ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
-        #   echo "accuracy=$ACC" >> $GITHUB_OUTPUT
+        # Nguong duoc doc tu metrics.json (nguon goc la params.yaml) thay vi hard-code,
+        # de eval gate va bo sieu tham so luon di cung nhau trong mot commit.
         run: |
-          # <dien code o day>
+          ACC=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
+          THR=$(python -c "import json; print(json.load(open('outputs/metrics.json')).get('eval_threshold', 0.70))")
+          echo "accuracy=$ACC" >> $GITHUB_OUTPUT
+          echo "threshold=$THR" >> $GITHUB_OUTPUT
+          echo "accuracy=$ACC | threshold=$THR"
 
-      - name: Upload model to Cloud Storage
-        # TODO 5: Su dung cloud SDK de upload models/model.pkl len
-        #         <bucket>/models/latest/model.pkl.
-        #         Ten bucket lay tu secret CLOUD_BUCKET.
+      - name: Upload candidate model to Cloud Storage
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
         run: |
-          python - <<'EOF'
-          # <dien code Python o day>
-          EOF
+          python - <<'PY'
+          import boto3, os
+          bucket = os.environ["CLOUD_BUCKET"]
+          s3 = boto3.client("s3")
+          s3.upload_file("models/model.pkl", bucket, "models/candidate/model.pkl")
+          s3.upload_file("outputs/metrics.json", bucket, "models/candidate/metrics.json")
+          print(f"Da upload candidate len s3://{bucket}/models/candidate/")
+          PY
 
-      - name: Save metrics as artifact
+      - name: Save metrics and report as artifacts
         uses: actions/upload-artifact@v4
         with:
           name: metrics
-          path: outputs/metrics.json
+          path: |
+            outputs/metrics.json
+            outputs/report.txt
 
 
   # ---------------------------------------------------------------------------
   # JOB 3 - EVAL
-  # Kiem tra nguong chat luong (accuracy >= 0.70).
+  # Hai cong kiem tra chat luong:
+  #   1. accuracy >= nguong tuyet doi (tu params.yaml)
+  #   2. accuracy >= accuracy cua model dang chay (Bonus 4 - chong tut hieu nang)
   # Pipeline dung lai o day neu mo hinh chua dat yeu cau.
-  # Chi chay khi Job 2 (Train) hoan thanh thanh cong.
   # ---------------------------------------------------------------------------
   eval:
     name: Eval
@@ -115,24 +166,50 @@ jobs:
     steps:
 
       - name: Check eval gate
-        # TODO 6: Doc accuracy tu output cua job train.
-        #         Neu accuracy < 0.70, ket thuc voi loi ro rang.
-        #         Neu dat nguong, in thong bao va tiep tuc.
-        #
-        # Goi y:
-        #   acc = float("${{ needs.train.outputs.accuracy }}")
-        #   if acc < 0.70:
-        #       raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Huy deploy.")
-        #   print("PASSED: dang trien khai model.")
+        # Outputs cua job luon la chuoi, bat buoc phai float() truoc khi so sanh.
+        env:
+          ACCURACY: ${{ needs.train.outputs.accuracy }}
+          THRESHOLD: ${{ needs.train.outputs.threshold }}
+          PREVIOUS_ACCURACY: ${{ needs.train.outputs.previous_accuracy }}
         run: |
-          python - <<'EOF'
-          # <dien code Python o day>
-          EOF
+          python3 - <<'PY'
+          import os
+
+          acc = float(os.environ["ACCURACY"])
+          thr = float(os.environ["THRESHOLD"])
+          previous = os.environ.get("PREVIOUS_ACCURACY", "").strip()
+
+          print(f"accuracy model moi   = {acc:.4f}")
+          print(f"nguong toi thieu     = {thr:.4f}")
+          print(f"accuracy model dang chay = {previous or '(chua co)'}")
+          print("-" * 46)
+
+          # Cong 1: nguong chat luong tuyet doi.
+          if acc < thr:
+              raise SystemExit(f"FAILED: accuracy {acc:.4f} < nguong {thr:.4f}. Huy deploy.")
+          print(f"PASSED cong 1: {acc:.4f} >= {thr:.4f}")
+
+          # Cong 2 (Bonus 4): khong cho model kem hon thay the model dang chay.
+          if previous:
+              prev = float(previous)
+              delta = acc - prev
+              if acc < prev:
+                  raise SystemExit(
+                      f"FAILED: accuracy {acc:.4f} thap hon model dang chay {prev:.4f} "
+                      f"({delta:+.4f}). Huy deploy, giu nguyen model cu."
+                  )
+              print(f"PASSED cong 2: {acc:.4f} >= {prev:.4f} ({delta:+.4f})")
+          else:
+              print("BO QUA cong 2: chua co model nao dang chay de so sanh.")
+
+          print("-" * 46)
+          print("PASSED: dang trien khai model.")
+          PY
 
 
   # ---------------------------------------------------------------------------
   # JOB 4 - DEPLOY
-  # Trien khai len VM qua SSH.
+  # Promote candidate -> latest tren S3, roi restart service tren VM qua SSH.
   # Chi chay khi Job 3 (Eval) hoan thanh thanh cong.
   # ---------------------------------------------------------------------------
   deploy:
@@ -141,6 +218,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
+      - name: Authenticate to Cloud Storage
+        env:
+          CLOUD_CREDENTIALS: ${{ secrets.CLOUD_CREDENTIALS }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          creds = json.loads(os.environ["CLOUD_CREDENTIALS"])
+          key_id = creds["aws_access_key_id"]
+          secret = creds["aws_secret_access_key"]
+          print(f"::add-mask::{key_id}")
+          print(f"::add-mask::{secret}")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"AWS_ACCESS_KEY_ID={key_id}\n")
+              env.write(f"AWS_SECRET_ACCESS_KEY={secret}\n")
+              env.write(f"AWS_DEFAULT_REGION={os.environ['AWS_REGION']}\n")
+          PY
+
+      - name: Promote candidate to latest
+        # Chi den buoc nay model moi tro thanh "model dang chay". Truoc do no chi la
+        # candidate, nen mot lan chay bi eval gate chan khong lam hong gi ca.
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+        run: |
+          aws s3 cp "s3://$CLOUD_BUCKET/models/candidate/model.pkl" \
+                    "s3://$CLOUD_BUCKET/models/latest/model.pkl"
+          aws s3 cp "s3://$CLOUD_BUCKET/models/candidate/metrics.json" \
+                    "s3://$CLOUD_BUCKET/models/latest/metrics.json"
+          echo "Da promote candidate -> latest."
+
       - name: SSH deploy to VM
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -148,12 +254,21 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            # TODO 7: Restart service mlops-serve tren VM.
-            # TODO 8: Cho server san sang roi goi curl /health de xac nhan.
-            #         Neu health check that bai sau nhieu lan thu, thoat voi exit 1.
-            #
-            # Goi y:
-            #   sudo systemctl restart mlops-serve
-            #   sleep 5
-            #   curl -sf http://localhost:8000/health && echo "Health check passed." || exit 1
-            # <dien lenh bash o day>
+            # Service tai model tu S3 khi khoi dong, nen restart la du de nhan model moi.
+            sudo systemctl restart mlops-serve
+
+            # Doi server san sang thay vi sleep co dinh: tai model tu S3 co the mat
+            # vai giay, va mot lan sleep 5 khong du tin cay de ket luan deploy that bai.
+            for i in $(seq 1 10); do
+              if curl -sf http://localhost:8000/health; then
+                echo ""
+                echo "Health check passed (lan thu $i)."
+                exit 0
+              fi
+              echo "Cho server san sang... ($i/10)"
+              sleep 3
+            done
+
+            echo "Health check that bai sau 10 lan thu. Log cua service:"
+            sudo journalctl -u mlops-serve -n 30 --no-pager
+            exit 1
