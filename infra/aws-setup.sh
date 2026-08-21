@@ -5,7 +5,7 @@
 #   - S3 bucket            : luu DVC remote + model artifact
 #   - IAM user mlops-lab-ci: danh tinh cho GitHub Actions (quyen toi thieu)
 #   - IAM role  mlops-lab-ec2-role : danh tinh cho EC2 doc model (chi doc)
-#   - Security group       : mo 22 (chi IP cua ban) va 8000 (public)
+#   - Security group       : mo 22 va 8000 (SSH chi xac thuc bang key)
 #   - EC2 t3.micro Ubuntu 22.04 : chay FastAPI inference server
 #
 # Script idempotent: chay lai nhieu lan khong tao trung tai nguyen.
@@ -142,7 +142,6 @@ fi
 
 # ---------------------------------------------------------------------------
 say "5. Security group: $SG_NAME"
-MY_IP="$(curl -s https://checkip.amazonaws.com | tr -d '[:space:]')"
 SG_ID=$(aws ec2 describe-security-groups --region "$REGION" \
   --filters "Name=group-name,Values=$SG_NAME" \
   --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
@@ -150,12 +149,17 @@ if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
   SG_ID=$(aws ec2 create-security-group --region "$REGION" --group-name "$SG_NAME" \
     --description "MLOps lab inference server" --query GroupId --output text)
 fi
-# Cong 22 chi mo cho IP cua ban; cong 8000 mo public de cham diem bang curl tu ngoai.
+# Cong 22 phai mo public: job Deploy SSH vao VM tu GitHub-hosted runner, ma runner
+# khong co dai IP co dinh - https://api.github.com/meta liet ke hang nghin CIDR, vuot
+# xa gioi han 60 rule cua mot security group. Bu lai VM chi chap nhan xac thuc bang
+# key: AMI Ubuntu dat san `passwordauthentication no`, va authorized_keys chi chua
+# dung mot key ed25519 (mlops_deploy).
+# Cong 8000 mo public de cham diem bang curl tu ngoai.
 aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG_ID" \
-  --protocol tcp --port 22 --cidr "${MY_IP}/32" 2>/dev/null || echo "rule 22 da co"
+  --protocol tcp --port 22 --cidr 0.0.0.0/0 2>/dev/null || echo "rule 22 da co"
 aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG_ID" \
   --protocol tcp --port 8000 --cidr 0.0.0.0/0 2>/dev/null || echo "rule 8000 da co"
-echo "SG_ID=$SG_ID (SSH mo cho ${MY_IP}/32)"
+echo "SG_ID=$SG_ID"
 
 # ---------------------------------------------------------------------------
 say "6. EC2 instance: $INSTANCE_NAME"
