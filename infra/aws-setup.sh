@@ -53,6 +53,8 @@ fi
 # ---------------------------------------------------------------------------
 say "2. IAM user cho CI: $CI_USER"
 # Quyen toi thieu: chi doc/ghi/xoa object BEN TRONG bucket nay, khong duoc xoa bucket.
+# Hai action *ObjectTagging la bat buoc cho buoc promote candidate -> latest:
+# `aws s3 cp` giua hai key S3 la copy phia server va luon doc/ghi tag cua object.
 CI_POLICY=$(cat <<JSON
 {
   "Version": "2012-10-17",
@@ -61,7 +63,10 @@ CI_POLICY=$(cat <<JSON
       "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
       "Resource": "arn:aws:s3:::${BUCKET}" },
     { "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Action": [
+        "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+        "s3:GetObjectTagging", "s3:PutObjectTagging"
+      ],
       "Resource": "arn:aws:s3:::${BUCKET}/*" }
   ]
 }
@@ -80,8 +85,24 @@ if [ "$EXISTING_KEYS" = "0" ]; then
   CI_SK=$(echo "$CI_KEY_JSON" | python -c "import sys,json;print(json.load(sys.stdin)['AccessKey']['SecretAccessKey'])")
   echo "da tao access key moi"
 else
-  CI_AK="<da ton tai - xoa key cu roi chay lai script neu can>"
-  CI_SK="<khong the doc lai secret key da tao truoc do>"
+  # AWS khong cho doc lai secret key da tao. Neu lan chay truoc da ghi key that vao
+  # secrets.txt thi giu nguyen gia tri do, tuyet doi khong ghi de bang placeholder -
+  # lam vay se pha mat credentials duy nhat ban dang co.
+  CI_AK=""; CI_SK=""
+  if [ -f "$OUT" ]; then
+    PREV_LINE=$(grep -A1 '^CLOUD_CREDENTIALS$' "$OUT" | tail -1)
+    case "$PREV_LINE" in
+      *AKIA*)
+        CI_AK=$(printf %s "$PREV_LINE" | python -c "import sys,json;print(json.load(sys.stdin)['aws_access_key_id'])")
+        CI_SK=$(printf %s "$PREV_LINE" | python -c "import sys,json;print(json.load(sys.stdin)['aws_secret_access_key'])")
+        echo "giu lai access key da ghi o lan chay truoc"
+        ;;
+    esac
+  fi
+  if [ -z "$CI_AK" ]; then
+    CI_AK="<da ton tai nhung khong doc lai duoc>"
+    CI_SK="<xoa key cu roi chay lai script: aws iam delete-access-key ...>"
+  fi
   echo "user da co $EXISTING_KEYS access key, khong tao them"
 fi
 
